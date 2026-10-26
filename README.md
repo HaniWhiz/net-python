@@ -16,7 +16,7 @@
 
 | | ۱. اسکریپت ساده | ۲. اسکریپت کامل | ۳. روی خود سوییچ |
 | --- | --- | --- | --- |
-| فایل | `arp_clear_v2.py` | `clear_arp.py` + `devices.csv` | `nxos_scheduler_arp_clear.txt` |
+| فایل | `clear-arp_incremental.py` | `clear-arp_parallel.py` + `devices_parallel.csv` | `nxos_scheduler_arp_clear.txt` |
 | محل اجرا | کامپیوتر خودتان | سرور (Windows Task Scheduler) | هر سوییچ |
 | پایتون لازم است؟ | بله | بله | خیر |
 | فهرست سوییچ‌ها | داخل اسکریپت | `devices.csv` | روی هر سوییچ جداگانه |
