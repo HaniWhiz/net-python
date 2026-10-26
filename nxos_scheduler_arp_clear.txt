@@ -1,0 +1,95 @@
+NX-OS on-box scheduler: daily ARP clear (no Python)
+====================================================
+Target: Cisco Nexus 3000 (scheduler syntax per N3K System Management guides 5.0(3), 7.x, 9.3(x)).
+Not tested on a live switch - do STEP 1 first.
+
+----------------------------------------------------
+STEP 1 - Run by hand once on each switch
+----------------------------------------------------
+show ip arp summary
+clear ip arp vrf default
+show ip arp summary
+show clock >> bootflash:arp_clear_history.txt
+
+Check:
+- "clear" returns straight to the prompt with no question (scheduled jobs
+  run non-interactively and cannot answer prompts).
+- Any static ARP entries are still present afterwards.
+- The ">>" append worked:  show file bootflash:arp_clear_history.txt
+  (">>" is shown in a scheduler job in the N9K guide; the N3K guide only
+  documents ">".)
+
+----------------------------------------------------
+STEP 2 - Config (paste on each switch)
+----------------------------------------------------
+If you log in via TACACS+/RADIUS, FIRST run in config mode:
+  scheduler aaa-authentication password 0 [your login password]
+(The job runs as the user who created it. Re-enter it whenever that password changes.)
+
+configure terminal
+feature scheduler
+scheduler logfile size 1024
+scheduler job name ARP-CLEAR
+show clock >> bootflash:arp_clear_history.txt ; show ip arp summary >> bootflash:arp_clear_history.txt ; clear ip arp vrf default ; show ip arp summary >> bootflash:arp_clear_history.txt
+exit
+scheduler schedule name ARP-CLEAR-DAILY
+job name ARP-CLEAR
+time daily 03:00
+exit
+end
+copy running-config startup-config
+
+Notes:
+- 03:00 is the switch's own clock (show clock). All switches fire at the
+  same moment; use a different time per switch, especially on vPC peers.
+- All VRFs: use "vrf all" in the clear AND both show commands
+  (show ip arp summary vrf all). Add "force-delete" only if you want
+  entries removed without a refresh.
+- Job commands cannot be edited. To change:
+    no scheduler job name ARP-CLEAR
+  recreate it, then confirm "show scheduler schedule" still lists it.
+
+----------------------------------------------------
+STEP 3 - Test without waiting until 3 AM
+----------------------------------------------------
+Set [HH:MM] to 2-3 minutes after the switch's current time:
+
+configure terminal
+scheduler schedule name ARP-TEST
+job name ARP-CLEAR
+time daily [HH:MM]
+end
+
+After it runs:
+
+show scheduler schedule
+show scheduler logfile
+show file bootflash:arp_clear_history.txt
+
+Then DELETE the test schedule (otherwise it also runs daily at that time):
+
+configure terminal
+no scheduler schedule name ARP-TEST
+end
+copy running-config startup-config
+
+- show scheduler logfile: each run shows Success (0) or Failed (1), plus any
+  errors from the clear command.
+- History file: time + before/after ARP summary for each run.
+
+----------------------------------------------------
+Limits vs. the Python script
+----------------------------------------------------
+- Results stay on each switch as plain text: no parsed counts, CSV, exit code or email.
+- No prompt answering or retry.
+- History file grows a few lines per day; prune occasionally.
+  Scheduler log is capped at 1024 KB; output beyond that is truncated.
+- Upside: keeps running even if the Windows server or SSH is down.
+
+----------------------------------------------------
+Sources
+----------------------------------------------------
+N3K 9.3(x) scheduler: https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus3000/sw/system_mgmt/93x/system-management/b-cisco-nexus-3000-series-nx-os-system-management-configuration-guide-93x/b-cisco-nexus-3000-series-nx-os-system-management-configuration-guide-93x_chapter_01011.html
+N3K 7.x scheduler:    https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus3000/sw/system_mgmt/7_x/b_Cisco_Nexus_3000_Series_NX-OS_System_Management_Configuration_Guide_7x/b_Cisco_Nexus_3000_Series_NX-OS_System_Management_Configuration_Guide_7x_chapter_01000.html
+N9K 9.3(x) scheduler (">>" example): https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus9000/sw/93x/system-management/b-cisco-nexus-9000-series-nx-os-system-management-configuration-guide-93x/b-cisco-nexus-9000-series-nx-os-system-management-configuration-guide-93x_chapter_0100001.html
+N3K 7.x redirect ">": https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus3000/sw/fundamentals/7x/b_Cisco_Nexus_3000_Series_NX-OS_Fundamentals_Configuration_Guide_7x/b_Cisco_Nexus_3000_Series_NX-OS_Fundamentals_Configuration_Guide_7x_chapter_0101.html
