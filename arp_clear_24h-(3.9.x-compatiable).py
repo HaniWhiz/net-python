@@ -4,6 +4,7 @@ import time
 import signal
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import paramiko
 import yaml
@@ -22,9 +23,9 @@ CHECK_EVERY = 30              # the while loop wakes up every 30 seconds
 COMMAND = "clear ip arp"
 CONFIG_FILE = Path(__file__).resolve().parent / "switches.yaml"   # jump server, switches, logins
 
-jump: paramiko.SSHClient | None = None     # connection to the jump server
-client: paramiko.SSHClient | None = None   # connection to the current switch
-chan: Channel | None = None                # shell on the current switch
+jump: Optional[paramiko.SSHClient] = None     # connection to the jump server
+client: Optional[paramiko.SSHClient] = None   # connection to the current switch
+chan: Optional[Channel] = None                # shell on the current switch
 
 
 def send(cmd, wait=1.0):
