@@ -1,0 +1,24 @@
+# switches.yaml - the switches to clear and how to log in to them.
+# Keep this file next to arp_clear_24h.py. It is read again before every run.
+#
+# Every switch uses the "auth" settings below, unless it sets its own
+# (see the last host). Login is tried in this order:
+#   1. key_files   2. keys in your SSH agent (YubiKey)   3. password
+
+auth:
+  username: admin
+  use_agent: true     # use the keys loaded in your SSH agent (your YubiKey)
+  key_files: []       # other private key files to try, e.g. ['~/.ssh/id_ed25519']
+  passphrase: ""      # passphrase for those key files, if they have one (plain text)
+  password: ""        # optional plain-text password, tried last ("" = not used)
+
+hosts:
+  - 10.0.0.11
+  - 10.0.0.12
+  - host: 10.0.0.13   # this switch uses its own login settings
+    username: netops
+    use_agent: false
+    key_files: ['~/.ssh/lab_key']
+    port: 22
+
+# Windows paths: use single quotes, e.g. 'C:\Users\4421184561\.ssh\id_ed25519'
