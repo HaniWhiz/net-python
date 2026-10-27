@@ -1,5 +1,4 @@
 import sys
-# sys.path.append(r"C:\Users\4421184561\Anaconda3\Lib\site-packages")  # uncomment if paramiko isn't found
 import os
 import time
 import signal
