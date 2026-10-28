@@ -20,7 +20,7 @@ RUN_EVERY = 24 * 60 * 60      # <<< 24h (normal)
 # ##################################################################
 
 CHECK_EVERY = 30              # the while loop wakes up every 30 seconds
-COMMAND = "clear ip arp"
+COMMAND = "clear mac address-table dynamic"
 CONFIG_FILE = Path(__file__).resolve().parent / "switches.yaml"   # jump server, switches, logins
 
 jump: Optional[paramiko.SSHClient] = None     # connection to the jump server
