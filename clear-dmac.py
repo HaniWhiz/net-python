@@ -17,7 +17,7 @@ from paramiko.channel import Channel
 COMMAND = "clear mac address-table dynamic"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "switches.yaml"   # Jump server & default login settings
-CSV_FILE = BASE_DIR / "simin.csv"       # Switch hostnames / IPs
+CSV_FILE = BASE_DIR / "shahriyar.csv"       # Switch hostnames / IPs
 
 
 def verify_ssh_agent() -> None:
