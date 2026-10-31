@@ -17,7 +17,7 @@ from paramiko.channel import Channel
 COMMAND = "clear mac address-table dynamic"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "switches.yaml"   # Jump server & default login settings
-CSV_FILE = BASE_DIR / "switches.csv"       # Switch hostnames / IPs
+CSV_FILE = BASE_DIR / "simin.csv"       # Switch hostnames / IPs
 
 
 def verify_ssh_agent() -> None:
@@ -36,8 +36,8 @@ def verify_ssh_agent() -> None:
 
 def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
     """
-    Read jump/auth defaults from switches.yaml and switch hostnames from switches.csv.
-    Works whether switches.csv has a header row ('host', 'ip', 'hostname') or is just a plain column of IPs/hostnames.
+    Read jump/auth defaults from switches.yaml and switch hostnames from switches.csv (or fallback to YAML hosts).
+    Automatically sanitizes hosts (strips CIDR masks like /64 and ignores header rows).
     """
     config = {}
     if CONFIG_FILE.exists():
@@ -45,58 +45,47 @@ def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
             config = yaml.safe_load(f) or {}
     defaults = config.get("auth") or {}
 
-    if not CSV_FILE.exists():
-        raise FileNotFoundError(f"CSV file not found: {CSV_FILE}")
-
-    # utf-8-sig automatically strips any BOM added by Excel for Mac when saving CSVs
-    with open(CSV_FILE, mode="r", encoding="utf-8-sig", newline="") as f:
-        sample = f.read(2048)
-        f.seek(0)
-        try:
-            # Handle comma, semicolon, or tab delimiters saved by Excel
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
-        rows = list(csv.reader(f, dialect))
-
-    if not rows:
-        return config.get("jump"), []
-
-    first_row = [cell.strip().lower() for cell in rows[0]]
-    host_synonyms = ("host", "hostname", "ip", "switch", "device")
-
-    # Detect if Row 1 is a header or the first switch
-    if any(h in first_row for h in host_synonyms):
-        headers = first_row
-        data_rows = rows[1:]
+    raw_hosts = []
+    if CSV_FILE.exists():
+        with open(CSV_FILE, mode="r", encoding="utf-8-sig", newline="") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            except csv.Error:
+                dialect = csv.excel
+            reader = csv.reader(f, dialect)
+            for row in reader:
+                for cell in row:
+                    if cell:
+                        raw_hosts.append(cell.strip())
     else:
-        headers = ["host"]
-        data_rows = rows
+        for entry in config.get("hosts") or []:
+            if isinstance(entry, str):
+                raw_hosts.append(entry.strip())
+            elif isinstance(entry, dict) and "host" in entry:
+                raw_hosts.append(str(entry["host"]).strip())
 
+    ignored_words = ("ip", "address", "hostname", "host", "switch", "device", "ip address")
     switches: list[tuple[str, dict]] = []
-    for row in data_rows:
-        if not row or all(cell.strip() == "" for cell in row):
+
+    for raw in raw_hosts:
+        if not raw or raw.startswith("#"):
             continue
 
-        row_dict: dict = {}
-        for idx, header in enumerate(headers):
-            if idx < len(row) and row[idx].strip() != "":
-                val = row[idx].strip()
-                if header in host_synonyms:
-                    row_dict["host"] = val
-                elif header == "port":
-                    row_dict["port"] = int(float(val))
-                elif header:
-                    row_dict[header] = val
+        # Strip CIDR mask (e.g., /64) if present
+        host = raw.split("/")[0].strip()
 
-        host = row_dict.get("host")
-        if host and not host.startswith("#"):  # Allow commenting out rows with '#'
-            merged_auth = {**defaults, **row_dict}
-            if not merged_auth.get("username"):
-                raise ValueError(
-                    f"Missing 'username' for host '{host}'. Set it in {CONFIG_FILE.name} under 'auth' or add a 'username' column in {CSV_FILE.name}."
-                )
-            switches.append((host, merged_auth))
+        # Skip header labels
+        if host.lower() in ignored_words or "ip address" in host.lower():
+            continue
+
+        merged_auth = {**defaults}
+        if not merged_auth.get("username"):
+            raise ValueError(
+                f"Missing 'username' in {CONFIG_FILE.name}. Please set 'username' under the 'auth' section."
+            )
+        switches.append((host, merged_auth))
 
     return config.get("jump"), switches
 
@@ -116,15 +105,15 @@ def open_ssh_client(host: str, auth: dict, sock=None) -> paramiko.SSHClient:
             host,
             port=int(auth.get("port", 22)),
             username=auth["username"],
-            key_filename=key_files or None,             # 1st: key files from YAML (if any)
-            passphrase=auth.get("passphrase") or None,  #      (and their passphrase)
-            allow_agent=use_agent,                      # 2nd: keys in your SSH agent (YubiKey)
-            password=auth.get("password") or None,      # 3rd: plain-text password, if set
-            look_for_keys=False,                        # Don't scan ~/.ssh files automatically
+            key_filename=key_files or None,
+            passphrase=auth.get("passphrase") or None,
+            allow_agent=use_agent,
+            password=auth.get("password") or None,
+            look_for_keys=False,
             timeout=15,
             banner_timeout=15,
             auth_timeout=15,
-            sock=sock,                                  # tunnel through the jump server, if any
+            sock=sock,
         )
         transport = ssh.get_transport()
         if transport:
@@ -140,9 +129,31 @@ def open_ssh_client(host: str, auth: dict, sock=None) -> paramiko.SSHClient:
         raise
 
 
+def read_until_prompt(chan: Channel, timeout: float = 15.0) -> str:
+    """
+    Continuously read from the channel until a Cisco prompt ('#' or '>') or '[confirm]'
+    appears at the end of the output, or until timeout expires.
+    """
+    output = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if chan.recv_ready():
+            chunk = chan.recv(99999).decode(errors="ignore")
+            output += chunk
+            stripped = output.strip()
+            if stripped.endswith("#") or stripped.endswith(">") or stripped.lower().endswith("[confirm]"):
+                # Small pause to make sure no trailing bytes are still in flight
+                time.sleep(0.1)
+                if not chan.recv_ready():
+                    break
+        else:
+            time.sleep(0.15)
+    return output
+
+
 @contextmanager
 def jump_session(jump_auth: Optional[dict]) -> Iterator[Optional[paramiko.SSHClient]]:
-    """Context manager for the jump host. Guarantees logout when the script finishes or errors."""
+    """Context manager for the jump host. Guarantees logout when done."""
     if not jump_auth:
         yield None
         return
@@ -162,10 +173,7 @@ def jump_session(jump_auth: Optional[dict]) -> Iterator[Optional[paramiko.SSHCli
 
 @contextmanager
 def switch_shell(host: str, auth: dict, jump_client: Optional[paramiko.SSHClient]) -> Iterator[Channel]:
-    """
-    Context manager for a single switch SSH session.
-    Opens the connection, yields the shell, and guarantees full VTY + TCP teardown on exit or error.
-    """
+    """Context manager for a single switch SSH session with strict cleanup."""
     sock = None
     client: Optional[paramiko.SSHClient] = None
     chan: Optional[Channel] = None
@@ -183,14 +191,17 @@ def switch_shell(host: str, auth: dict, jump_client: Optional[paramiko.SSHClient
         client = open_ssh_client(host, auth, sock=sock)
         chan = client.invoke_shell()
         chan.settimeout(30)
-        time.sleep(1.0)
-        if chan.recv_ready():
-            chan.recv(999999)  # flush initial login banner
+
+        # Wait dynamically for the initial login banner and prompt ('#' or '>')
+        initial_output = read_until_prompt(chan, timeout=12.0)
+        if not initial_output.strip().endswith(("#", ">")):
+            # Send a newline to wake up the VTY prompt if the banner paused
+            chan.send("\n")
+            initial_output += read_until_prompt(chan, timeout=5.0)
 
         yield chan
 
     finally:
-        # 1. Gracefully exit Cisco VTY line so the switch doesn't hold an orphaned session
         if chan is not None:
             try:
                 if not chan.closed:
@@ -203,14 +214,12 @@ def switch_shell(host: str, auth: dict, jump_client: Optional[paramiko.SSHClient
             except Exception:
                 pass
 
-        # 2. Close the Paramiko SSH client
         if client is not None:
             try:
                 client.close()
             except Exception:
                 pass
 
-        # 3. Close the jump-host direct-tcpip forwarding channel (if used)
         if sock is not None:
             try:
                 sock.close()
@@ -220,22 +229,28 @@ def switch_shell(host: str, auth: dict, jump_client: Optional[paramiko.SSHClient
         print(f"{datetime.now()} 🔒 Logged out of {host}")
 
 
-def send_cmd(chan: Channel, cmd: str, wait: float = 1.0) -> str:
-    """Send a command to the active switch channel and return the output."""
-    chan.send(cmd + "\n")
-    time.sleep(wait)
-    output = ""
-    while chan.recv_ready():
-        output += chan.recv(999999).decode(errors="ignore")
-    return output
-
-
 def clear_mac_table(chan: Channel, host: str) -> None:
-    """Run 'clear mac address-table dynamic' and verify the prompt."""
-    output = send_cmd(chan, COMMAND, wait=3.0)
-    # Handle IOS prompts that ask for [confirm] if any exist, though dynamic usually doesn't
+    # Flush any leftover characters before sending command
+    while chan.recv_ready():
+        chan.recv(99999)
+
+    chan.send(COMMAND + "\n")
+    output = read_until_prompt(chan, timeout=15.0)
+
+    # Handle [confirm] prompt if the switch asks for confirmation
     if "[confirm]" in output.lower():
-        output += send_cmd(chan, "", wait=2.0)
+        chan.send("\n")
+        output += read_until_prompt(chan, timeout=10.0)
+
+    # Fallback FOR NX-OS / older IOS syntax if 'clear mac address-table dynamic' is rejected
+    if "% invalid" in output.lower():
+        alt_cmd = "clear mac-address-table dynamic"
+        chan.send(alt_cmd + "\n")
+        alt_output = read_until_prompt(chan, timeout=15.0)
+        if "%" not in alt_output and alt_output.strip().endswith("#"):
+            print(f"{datetime.now()} ✅ Dynamic MAC address table cleared on {host} (via '{alt_cmd}')")
+            return
+        output += "\n" + alt_output
 
     if "%" in output or not output.strip().endswith("#"):
         print(f"{datetime.now()} ❌ {host} did not accept '{COMMAND}':\n{output.strip()}")
@@ -244,8 +259,7 @@ def clear_mac_table(chan: Channel, host: str) -> None:
 
 
 def _handle_sigterm(signum, frame):
-    # Raising SystemExit triggers all active 'finally:' blocks in the context managers!
-    print(f"\n{datetime.now()} 🛑 Termination signal received. Closing active SSH session...")
+    print(f"\n{datetime.now()} 🛑 Termination signal received. Closing active SSH sessions...")
     sys.exit(1)
 
 
@@ -263,7 +277,7 @@ def main() -> None:
         sys.exit(1)
 
     if not switches:
-        print(f"{datetime.now()} ⚠️  No switches found in {CSV_FILE.name}. Exiting.")
+        print(f"{datetime.now()} ⚠️  No valid switches found. Check your CSV or YAML file. Exiting.")
         return
 
     try:
