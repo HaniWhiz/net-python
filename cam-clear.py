@@ -1,4 +1,7 @@
+from __future__ import annotations  # Enables X | None syntax in Python 3.7 - 3.9
+
 import sys
+# sys.path.append(r"C:\Users\4421184561\Anaconda3\Lib\site-packages")  # uncomment if paramiko isn't found
 import os
 import time
 import signal
@@ -26,6 +29,17 @@ CONFIG_FILE = Path(__file__).resolve().parent / "switches.yaml"   # jump server,
 jump: Optional[paramiko.SSHClient] = None     # connection to the jump server
 client: Optional[paramiko.SSHClient] = None   # connection to the current switch
 chan: Optional[Channel] = None                # shell on the current switch
+
+
+def verify_ssh_agent():
+    """Verify that ssh-agent is running and has at least one key (e.g., YubiKey) loaded."""
+    agent = paramiko.Agent()
+    keys = agent.get_keys()
+    if not keys:
+        print(f"{datetime.now()} ⚠️  WARNING: No keys found in SSH agent! Make sure your YubiKey is loaded (check 'ssh-add -L').")
+    else:
+        key_names = ", ".join(k.get_name() for k in keys)
+        print(f"{datetime.now()} 🔐 SSH Agent active. Found {len(keys)} key(s): [{key_names}]")
 
 
 def send(cmd, wait=1.0):
@@ -83,6 +97,8 @@ def load_config():
 def ssh_connect(host, auth, sock=None):
     """Open one SSH connection with the login settings from the YAML."""
     key_files = [os.path.expanduser(k) for k in auth.get("key_files") or []]
+    use_agent = auth.get("use_agent", True)
+
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -90,11 +106,11 @@ def ssh_connect(host, auth, sock=None):
             host,
             port=auth.get("port", 22),
             username=auth["username"],
-            key_filename=key_files or None,             # 1st: key files from the YAML
+            key_filename=key_files or None,             # 1st: key files from the YAML (if any)
             passphrase=auth.get("passphrase") or None,  #      (and their passphrase)
-            allow_agent=auth.get("use_agent", True),    # 2nd: keys in your SSH agent (YubiKey)
+            allow_agent=use_agent,                      # 2nd: keys in your SSH agent (YubiKey)
             password=auth.get("password") or None,      # 3rd: plain-text password, if set
-            look_for_keys=False,
+            look_for_keys=False,                        # Don't scan ~/.ssh files automatically
             timeout=15,
             sock=sock,                                  # tunnel through the jump server, if any
         )
@@ -122,12 +138,12 @@ def login(host, auth):
     chan.recv(999999)         # skip the login banner
 
 
-def clear_arp(host):
+def clear_mac_table(host):
     output = send(COMMAND, wait=5)
     if "%" in output or not output.strip().endswith("#"):
         print(f"{datetime.now()} ❌ {host} did not accept '{COMMAND}':\n{output.strip()}")
     else:
-        print(f"{datetime.now()} ✅ ARP cleared on {host}")
+        print(f"{datetime.now()} ✅ Dynamic MAC address table cleared on {host}")
 
 
 last_run = 0  # 0 = never, so the first run starts right away
@@ -135,6 +151,8 @@ last_run = 0  # 0 = never, so the first run starts right away
 while True:
     if time.time() - last_run >= RUN_EVERY:
         last_run = time.time()
+        verify_ssh_agent()
+
         try:
             jump_auth, switches = load_config()  # read every run, so YAML changes apply next time
         except Exception as e:
@@ -153,7 +171,7 @@ while True:
             print(f"{datetime.now()} 🔑 Logging in to {host}")
             try:
                 login(host, auth)
-                clear_arp(host)
+                clear_mac_table(host)
             except Exception as e:
                 print(f"{datetime.now()} 📢 {host} failed: {type(e).__name__}: {e}")
             finally:
