@@ -14,7 +14,21 @@ import paramiko
 import yaml
 from paramiko.channel import Channel
 
-COMMAND = "clear mac address-table dynamic"
+COMMANDS = [
+    "configure terminal",
+    "feature scheduler",
+    "scheduler logfile size 1024",
+    "scheduler job name MAC-CLEAR",
+    "show clock >> bootflash:mac_clear_history.txt ; show mac address-table count >> bootflash:mac_clear_history.txt ; clear mac address-table dynamic ; show mac address-table count >> bootflash:mac_clear_history.txt",
+    "exit",
+    "scheduler schedule name MAC-CLEAR-DAILY",
+    "job name MAC-CLEAR",
+    "time daily 4:05",
+    "exit",
+    "end",
+    "copy running-config startup-config",
+]
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "switches.yaml"   # Jump server & default login settings
 CSV_FILE = BASE_DIR / "shahriyar.csv"       # Switch hostnames / IPs
@@ -131,8 +145,8 @@ def open_ssh_client(host: str, auth: dict, sock=None) -> paramiko.SSHClient:
 
 def read_until_prompt(chan: Channel, timeout: float = 15.0) -> str:
     """
-    Continuously read from the channel until a Cisco prompt ('#' or '>') or '[confirm]'
-    appears at the end of the output, or until timeout expires.
+    Continuously read from the channel until a Cisco prompt ('#' or '>'), '[confirm]',
+    or 'Destination filename' appears at the end of the output, or until timeout expires.
     """
     output = ""
     deadline = time.time() + timeout
@@ -141,7 +155,13 @@ def read_until_prompt(chan: Channel, timeout: float = 15.0) -> str:
             chunk = chan.recv(99999).decode(errors="ignore")
             output += chunk
             stripped = output.strip()
-            if stripped.endswith("#") or stripped.endswith(">") or stripped.lower().endswith("[confirm]"):
+            lower_stripped = stripped.lower()
+            if (
+                stripped.endswith("#")
+                or stripped.endswith(">")
+                or lower_stripped.endswith("[confirm]")
+                or "destination filename" in lower_stripped.splitlines()[-1:]
+            ):
                 # Small pause to make sure no trailing bytes are still in flight
                 time.sleep(0.1)
                 if not chan.recv_ready():
@@ -205,6 +225,9 @@ def switch_shell(host: str, auth: dict, jump_client: Optional[paramiko.SSHClient
         if chan is not None:
             try:
                 if not chan.closed:
+                    # Send 'end' and 'exit' to ensure clean exit even if interrupted mid-config
+                    chan.send("end\n")
+                    time.sleep(0.1)
                     chan.send("exit\n")
                     time.sleep(0.2)
             except Exception:
@@ -229,33 +252,36 @@ def switch_shell(host: str, auth: dict, jump_client: Optional[paramiko.SSHClient
         print(f"{datetime.now()} 🔒 Logged out of {host}")
 
 
-def clear_mac_table(chan: Channel, host: str) -> None:
-    # Flush any leftover characters before sending command
+def configure_mac_scheduler(chan: Channel, host: str) -> None:
+    """Push NX-OS scheduler configuration and save running-config to startup-config."""
+    # Flush any leftover characters before sending commands
     while chan.recv_ready():
         chan.recv(99999)
 
-    chan.send(COMMAND + "\n")
-    output = read_until_prompt(chan, timeout=15.0)
+    for cmd in COMMANDS:
+        # Saving config on Nexus switches can take 20-45 seconds
+        cmd_timeout = 60.0 if cmd.startswith("copy ") else 15.0
 
-    # Handle [confirm] prompt if the switch asks for confirmation
-    if "[confirm]" in output.lower():
-        chan.send("\n")
-        output += read_until_prompt(chan, timeout=10.0)
+        chan.send(cmd + "\n")
+        output = read_until_prompt(chan, timeout=cmd_timeout)
 
-    # Fallback FOR NX-OS / older IOS syntax if 'clear mac address-table dynamic' is rejected
-    if "% invalid" in output.lower():
-        alt_cmd = "clear mac-address-table dynamic"
-        chan.send(alt_cmd + "\n")
-        alt_output = read_until_prompt(chan, timeout=15.0)
-        if "%" not in alt_output and alt_output.strip().endswith("#"):
-            print(f"{datetime.now()} ✅ Dynamic MAC address table cleared on {host} (via '{alt_cmd}')")
+        # Handle confirmation prompts if any appear
+        lower_out = output.lower()
+        if "[confirm]" in lower_out or "destination filename" in lower_out:
+            chan.send("\n")
+            output += read_until_prompt(chan, timeout=cmd_timeout)
+
+        # Check for CLI error indicators (ignoring benign NX-OS '[#####]' progress bars)
+        has_error = any(
+            line.strip().startswith("%") or "% invalid" in line.lower() or "syntax error" in line.lower()
+            for line in output.splitlines()
+        )
+
+        if has_error or not output.strip().endswith("#"):
+            print(f"{datetime.now()} ❌ {host} rejected command '{cmd}':\n{output.strip()}")
             return
-        output += "\n" + alt_output
 
-    if "%" in output or not output.strip().endswith("#"):
-        print(f"{datetime.now()} ❌ {host} did not accept '{COMMAND}':\n{output.strip()}")
-    else:
-        print(f"{datetime.now()} ✅ Dynamic MAC address table cleared on {host}")
+    print(f"{datetime.now()} ✅ Scheduler 'MAC-CLEAR-DAILY' configured and config saved on {host}")
 
 
 def _handle_sigterm(signum, frame):
@@ -285,7 +311,7 @@ def main() -> None:
             for host, auth in switches:
                 try:
                     with switch_shell(host, auth, jump_client) as chan:
-                        clear_mac_table(chan, host)
+                        configure_mac_scheduler(chan, host)
                 except Exception as e:
                     print(f"{datetime.now()} 📢 {host} failed: {type(e).__name__}: {e}")
     except Exception as e:
