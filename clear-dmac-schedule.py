@@ -1,18 +1,22 @@
 from __future__ import annotations  # Enables X | None syntax in Python 3.7 - 3.9
 
 import csv
+import fcntl
 import os
+import pty
+import select
 import signal
+import struct
+import subprocess
 import sys
+import termios
 import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
-import paramiko
 import yaml
-from paramiko.channel import Channel
 
 COMMANDS = [
     "clear mac address-table dynamic",
@@ -35,18 +39,60 @@ CONFIG_FILE = BASE_DIR / "switches.yaml"   # Jump server & default login setting
 CSV_FILE = BASE_DIR / "bamdad.csv"          # Switch hostnames / IPs
 
 
+class NativeSSHChannel:
+    """Wraps macOS native /usr/bin/ssh in a PTY with the same interface as a Paramiko Channel."""
+
+    def __init__(self, master_fd: int, proc: subprocess.Popen):
+        self.master_fd = master_fd
+        self.proc = proc
+        self.closed = False
+
+    def recv_ready(self) -> bool:
+        if self.closed or self.master_fd < 0:
+            return False
+        r, _, _ = select.select([self.master_fd], [], [], 0)
+        return bool(r)
+
+    def recv(self, bufsize: int = 65536) -> bytes:
+        if self.closed or self.master_fd < 0:
+            return b""
+        try:
+            return os.read(self.master_fd, min(bufsize, 65536))
+        except OSError:
+            return b""
+
+    def send(self, data: str) -> int:
+        if self.closed or self.master_fd < 0:
+            return 0
+        return os.write(self.master_fd, data.encode("utf-8"))
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            os.close(self.master_fd)
+        except OSError:
+            pass
+        if self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+
+
 def verify_ssh_agent() -> None:
-    """Verify that ssh-agent is running and has at least one key (e.g., YubiKey) loaded."""
-    agent = paramiko.Agent()
-    try:
-        keys = agent.get_keys()
-        if not keys:
-            print(f"{datetime.now()} ⚠️  WARNING: No keys found in SSH agent! Make sure your YubiKey is loaded (check 'ssh-add -L').")
-        else:
-            key_names = ", ".join(k.get_name() for k in keys)
-            print(f"{datetime.now()} 🔐 SSH Agent active. Found {len(keys)} key(s): [{key_names}]")
-    finally:
-        agent.close()
+    """Verify ssh-agent using native macOS ssh-add."""
+    res = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
+    if res.returncode != 0 or not res.stdout.strip():
+        print(f"{datetime.now()} ⚠️  WARNING: No keys found in SSH agent! (check 'ssh-add -L').")
+    else:
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+        print(f"{datetime.now()} 🔐 Native SSH Agent active. Found {len(lines)} key(s).")
 
 
 def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
@@ -105,204 +151,211 @@ def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
     return config.get("jump"), switches
 
 
-def _open_tunnel_sock(jump_client: Optional[paramiko.SSHClient], host: str, port: int):
-    """Helper to open a fresh direct-tcpip channel from the jump server."""
-    if jump_client is None:
-        return None
-    transport = jump_client.get_transport()
-    if transport is None or not transport.is_active():
-        raise RuntimeError("Jump server connection is no longer active")
-    return transport.open_channel("direct-tcpip", (host, port), ("127.0.0.1", 0), timeout=15)
-
-
-def open_ssh_client(
-    host: str,
-    auth: dict,
-    jump_client: Optional[paramiko.SSHClient] = None,
-) -> tuple[paramiko.SSHClient, Optional[Channel]]:
-    """
-    Open and return (SSHClient, sock).
-    Automatically retries with legacy ssh-rsa if YubiKey/agent rejects SHA-2 signing.
-    """
+def _build_ssh_base_args(auth: dict) -> list[str]:
+    """Common OpenSSH flags supporting both modern servers and legacy Cisco switches."""
+    args = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=10",
+        "-o", "PubkeyAcceptedKeyTypes=+ssh-rsa",
+        "-o", "HostKeyAlgorithms=+ssh-rsa,ssh-dss",
+        "-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group1-sha1,diffie-hellman-group-exchange-sha1",
+        "-o", "Ciphers=+aes128-cbc,aes256-cbc,3des-cbc",
+    ]
     raw_keys = auth.get("key_files") or []
     if isinstance(raw_keys, str):
         raw_keys = [raw_keys]
-    key_files = [os.path.expanduser(k) for k in raw_keys]
-    use_agent = auth.get("use_agent", True)
-    port = int(auth.get("port", 22))
-
-    # Try 1: Standard connection (or user-defined disabled_algorithms)
-    # Try 2: Force legacy ssh-rsa signatures (fixes YubiKey PKCS#11 'key cannot be used for signing')
-    attempts = [
-        auth.get("disabled_algorithms"),
-        {"pubkeys": ["rsa-sha2-512", "rsa-sha2-256"]},
-    ]
-
-    last_err = None
-    for idx, disabled_algos in enumerate(attempts):
-        sock = None
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            sock = _open_tunnel_sock(jump_client, host, port)
-            connect_kwargs = dict(
-                hostname=host,
-                port=port,
-                username=auth["username"],
-                key_filename=key_files or None,
-                passphrase=auth.get("passphrase") or None,
-                allow_agent=use_agent,
-                password=auth.get("password") or None,
-                look_for_keys=False,
-                timeout=15,
-                banner_timeout=15,
-                auth_timeout=15,
-                sock=sock,
-            )
-            if disabled_algos:
-                connect_kwargs["disabled_algorithms"] = disabled_algos
-
-            ssh.connect(**connect_kwargs)
-            transport = ssh.get_transport()
-            if transport:
-                transport.set_keepalive(10)
-            return ssh, sock
-
-        except paramiko.SSHException as e:
-            ssh.close()
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            last_err = e
-            if "key cannot be used for signing" in str(e).lower() and idx == 0:
-                print(f"{datetime.now()} 🔄 {host}: Agent rejected RSA-SHA2 signature, retrying with legacy ssh-rsa...")
-                continue
-            break
-        except Exception:
-            ssh.close()
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            raise
-
-    if last_err and "key cannot be used for signing" in str(last_err).lower():
-        print(
-            f"\n{datetime.now()} 💡 YUBIKEY AGENT LOCKED/STALE: macOS ssh-agent lost connection to your YubiKey.\n"
-            f"   Run 'ssh-add -D' in Terminal, unplug/re-insert your YubiKey, and reload it into ssh-agent.\n"
-        )
-    raise last_err
+    for k in raw_keys:
+        expanded = os.path.expanduser(k)
+        if os.path.exists(expanded):
+            args.extend(["-i", expanded])
+    return args
 
 
-def read_until_prompt(chan: Channel, timeout: float = 15.0) -> str:
+def _spawn_pty_ssh(cmd: list[str]) -> NativeSSHChannel:
+    """Spawn native /usr/bin/ssh inside a wide PTY with local echo disabled."""
+    master_fd, slave_fd = pty.openpty()
+
+    # Disable local PTY echo so we only read actual output from the remote device
+    attrs = termios.tcgetattr(slave_fd)
+    attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+
+    # Set terminal width to 512 cols so long NX-OS scheduler commands never wrap
+    winsize = struct.pack("HHHH", 50, 512, 0, 0)
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    return NativeSSHChannel(master_fd, proc)
+
+
+def read_until_prompt(
+    chan: NativeSSHChannel,
+    timeout: float = 15.0,
+    password: Optional[str] = None,
+) -> str:
     """
     Continuously read from the channel until a Cisco prompt ('#' or '>'), '[confirm]',
     or 'Destination filename' appears at the end of the output, or until timeout expires.
     """
     output = ""
+    password_sent = False
     deadline = time.time() + timeout
+
     while time.time() < deadline:
         if chan.recv_ready():
-            chunk = chan.recv(99999).decode(errors="ignore")
+            chunk = chan.recv(65536).decode(errors="ignore")
+            if not chunk and chan.proc.poll() is not None:
+                break
             output += chunk
             stripped = output.strip()
             lower_stripped = stripped.lower()
+
+            # Automatically supply password if prompted and configured in YAML
+            if password and not password_sent and lower_stripped.endswith("password:"):
+                chan.send(password + "\n")
+                password_sent = True
+                output = ""
+                continue
+
             if (
                 stripped.endswith("#")
                 or stripped.endswith(">")
                 or lower_stripped.endswith("[confirm]")
                 or "destination filename" in lower_stripped.splitlines()[-1:]
             ):
-                # Small pause to make sure no trailing bytes are still in flight
                 time.sleep(0.1)
                 if not chan.recv_ready():
                     break
         else:
+            if chan.proc.poll() is not None and not chan.recv_ready():
+                break
             time.sleep(0.15)
     return output
 
 
 @contextmanager
-def jump_session(jump_auth: Optional[dict]) -> Iterator[Optional[paramiko.SSHClient]]:
-    """Context manager for the jump host. Guarantees logout when done."""
+def jump_session(jump_auth: Optional[dict]) -> Iterator[Optional[dict]]:
+    """
+    Open a persistent native OpenSSH ControlMaster connection to the jump server.
+    Guarantees clean logout when done.
+    """
     if not jump_auth:
         yield None
         return
 
     host = jump_auth["host"]
-    print(f"{datetime.now()} 🔑 Logging in to jump server {host}")
-    jump_client, _ = open_ssh_client(host, jump_auth)
+    user = jump_auth["username"]
+    port = int(jump_auth.get("port", 22))
+    # Short path in /tmp avoids macOS 104-char Unix socket path limit
+    control_path = f"/tmp/ssh-jump-{os.getpid()}.sock"
+
+    print(f"{datetime.now()} 🔑 Logging in to jump server {host} via native SSH")
+
+    cmd = [
+        "ssh",
+        "-M",
+        "-S", control_path,
+        "-o", "ControlPersist=30m",
+        "-p", str(port),
+        *_build_ssh_base_args(jump_auth),
+        f"{user}@{host}",
+        "echo __JUMP_READY__",
+    ]
+
+    chan = _spawn_pty_ssh(cmd)
     try:
-        yield jump_client
+        output = ""
+        password_sent = False
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            if chan.recv_ready():
+                chunk = chan.recv(65536).decode(errors="ignore")
+                output += chunk
+                if jump_auth.get("password") and not password_sent and output.strip().lower().endswith("password:"):
+                    chan.send(jump_auth["password"] + "\n")
+                    password_sent = True
+                    continue
+                if "__JUMP_READY__" in output:
+                    break
+            elif chan.proc.poll() is not None:
+                break
+            else:
+                time.sleep(0.15)
+
+        if "__JUMP_READY__" not in output and not os.path.exists(control_path):
+            raise RuntimeError(f"Jump server connection failed: {output.strip()}")
+
+        chan.close()
+        yield {"host": host, "user": user, "port": port, "control_path": control_path}
+
     finally:
-        try:
-            jump_client.close()
-        except Exception:
-            pass
+        chan.close()
+        if os.path.exists(control_path):
+            subprocess.run(
+                ["ssh", "-S", control_path, "-O", "exit", f"{user}@{host}"],
+                capture_output=True,
+            )
         print(f"{datetime.now()} 🔒 Logged out of jump server {host}")
 
 
 @contextmanager
-def switch_shell(host: str, auth: dict, jump_client: Optional[paramiko.SSHClient]) -> Iterator[Channel]:
-    """Context manager for a single switch SSH session with strict cleanup."""
-    sock = None
-    client: Optional[paramiko.SSHClient] = None
-    chan: Optional[Channel] = None
+def switch_shell(host: str, auth: dict, jump_info: Optional[dict]) -> Iterator[NativeSSHChannel]:
+    """Context manager for a single switch SSH session using native macOS SSH."""
+    user = auth["username"]
+    port = int(auth.get("port", 22))
 
     print(f"{datetime.now()} 🔑 Logging in to {host}")
-    try:
-        client, sock = open_ssh_client(host, auth, jump_client=jump_client)
-        chan = client.invoke_shell()
-        chan.settimeout(30)
 
-        # Wait dynamically for the initial login banner and prompt ('#' or '>')
-        initial_output = read_until_prompt(chan, timeout=12.0)
+    cmd = ["ssh", "-tt", "-p", str(port), *_build_ssh_base_args(auth)]
+    if jump_info is not None:
+        target = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        proxy_cmd = (
+            f"ssh -S {jump_info['control_path']} "
+            f"-p {jump_info['port']} {jump_info['user']}@{jump_info['host']} -W {target}"
+        )
+        cmd.extend(["-o", f"ProxyCommand={proxy_cmd}"])
+
+    cmd.append(f"{user}@{host}")
+    chan = _spawn_pty_ssh(cmd)
+
+    try:
+        initial_output = read_until_prompt(chan, timeout=20.0, password=auth.get("password"))
         if not initial_output.strip().endswith(("#", ">")):
-            # Send a newline to wake up the VTY prompt if the banner paused
             chan.send("\n")
             initial_output += read_until_prompt(chan, timeout=5.0)
+
+        if not initial_output.strip().endswith(("#", ">")):
+            raise RuntimeError(f"Did not reach switch prompt. Output: {initial_output.strip()}")
 
         yield chan
 
     finally:
-        if chan is not None:
-            try:
-                if not chan.closed:
-                    # Send 'end' and 'exit' to ensure clean exit even if interrupted mid-config
-                    chan.send("end\n")
-                    time.sleep(0.1)
-                    chan.send("exit\n")
-                    time.sleep(0.2)
-            except Exception:
-                pass
-            try:
-                chan.close()
-            except Exception:
-                pass
-
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
-
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
-
+        try:
+            if not chan.closed:
+                chan.send("end\n")
+                time.sleep(0.1)
+                chan.send("exit\n")
+                time.sleep(0.2)
+        except Exception:
+            pass
+        chan.close()
         print(f"{datetime.now()} 🔒 Logged out of {host}")
 
 
-def configure_mac_scheduler(chan: Channel, host: str) -> None:
+def configure_mac_scheduler(chan: NativeSSHChannel, host: str) -> None:
     """Clear dynamic MAC table immediately, configure NX-OS daily scheduler, and save config."""
-    # Flush any leftover characters before sending commands
     while chan.recv_ready():
-        chan.recv(99999)
+        chan.recv(65536)
 
     for cmd in COMMANDS:
         # Saving config on Nexus switches can take 20-45 seconds
@@ -359,10 +412,10 @@ def main() -> None:
         return
 
     try:
-        with jump_session(jump_auth) as jump_client:
+        with jump_session(jump_auth) as jump_info:
             for host, auth in switches:
                 try:
-                    with switch_shell(host, auth, jump_client) as chan:
+                    with switch_shell(host, auth, jump_info) as chan:
                         configure_mac_scheduler(chan, host)
                 except Exception as e:
                     print(f"{datetime.now()} 📢 {host} failed: {type(e).__name__}: {e}")
