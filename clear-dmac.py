@@ -31,7 +31,7 @@ COMMANDS = [
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "switches.yaml"   # Jump server & default login settings
-CSV_FILE = BASE_DIR / "shahriyar.csv"       # Switch hostnames / IPs
+CSV_FILES = "shahriyar.csv, bamdad.csv, Simin.csv, forough.csv"  # Comma-separated string or list of CSVs
 
 
 def verify_ssh_agent() -> None:
@@ -50,8 +50,8 @@ def verify_ssh_agent() -> None:
 
 def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
     """
-    Read jump/auth defaults from switches.yaml and switch hostnames from switches.csv (or fallback to YAML hosts).
-    Automatically sanitizes hosts (strips CIDR masks like /64 and ignores header rows).
+    Read jump/auth defaults from switches.yaml and switch hostnames from multiple CSV files
+    (or fallback to YAML hosts). Automatically sanitizes and deduplicates hosts.
     """
     config = {}
     if CONFIG_FILE.exists():
@@ -59,20 +59,35 @@ def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
             config = yaml.safe_load(f) or {}
     defaults = config.get("auth") or {}
 
+    # Parse CSV_FILES whether it's a comma-separated string or a list
+    if isinstance(CSV_FILES, str):
+        csv_names = [name.strip() for name in CSV_FILES.split(",") if name.strip()]
+    else:
+        csv_names = [str(name).strip() for name in CSV_FILES if str(name).strip()]
+
+    csv_paths = [BASE_DIR / name for name in csv_names]
+    existing_csvs = [p for p in csv_paths if p.exists()]
+
+    for p in csv_paths:
+        if not p.exists():
+            print(f"{datetime.now()} ⚠️  WARNING: CSV file not found and skipped: {p.name}")
+
     raw_hosts = []
-    if CSV_FILE.exists():
-        with open(CSV_FILE, mode="r", encoding="utf-8-sig", newline="") as f:
-            sample = f.read(2048)
-            f.seek(0)
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-            except csv.Error:
-                dialect = csv.excel
-            reader = csv.reader(f, dialect)
-            for row in reader:
-                for cell in row:
-                    if cell:
-                        raw_hosts.append(cell.strip())
+    if existing_csvs:
+        for csv_path in existing_csvs:
+            print(f"{datetime.now()} 📄 Loading switches from {csv_path.name}...")
+            with open(csv_path, mode="r", encoding="utf-8-sig", newline="") as f:
+                sample = f.read(2048)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+                except csv.Error:
+                    dialect = csv.excel
+                reader = csv.reader(f, dialect)
+                for row in reader:
+                    for cell in row:
+                        if cell:
+                            raw_hosts.append(cell.strip())
     else:
         for entry in config.get("hosts") or []:
             if isinstance(entry, str):
@@ -82,6 +97,7 @@ def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
 
     ignored_words = ("ip", "address", "hostname", "host", "switch", "device", "ip address")
     switches: list[tuple[str, dict]] = []
+    seen_hosts: set[str] = set()
 
     for raw in raw_hosts:
         if not raw or raw.startswith("#"):
@@ -90,10 +106,11 @@ def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
         # Strip CIDR mask (e.g., /64) if present
         host = raw.split("/")[0].strip()
 
-        # Skip header labels
-        if host.lower() in ignored_words or "ip address" in host.lower():
+        # Skip header labels or duplicate entries across CSVs
+        if host.lower() in ignored_words or "ip address" in host.lower() or host in seen_hosts:
             continue
 
+        seen_hosts.add(host)
         merged_auth = {**defaults}
         if not merged_auth.get("username"):
             raise ValueError(
@@ -305,6 +322,8 @@ def main() -> None:
     if not switches:
         print(f"{datetime.now()} ⚠️  No valid switches found. Check your CSV or YAML file. Exiting.")
         return
+
+    print(f"{datetime.now()} 📋 Total unique switches queued: {len(switches)}")
 
     try:
         with jump_session(jump_auth) as jump_client:
