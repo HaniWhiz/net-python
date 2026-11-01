@@ -32,7 +32,7 @@ COMMANDS = [
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "switches.yaml"   # Jump server & default login settings
-CSV_FILE = BASE_DIR / "bamdad.csv"       # Switch hostnames / IPs
+CSV_FILE = BASE_DIR / "bamdad.csv"          # Switch hostnames / IPs
 
 
 def verify_ssh_agent() -> None:
@@ -51,7 +51,7 @@ def verify_ssh_agent() -> None:
 
 def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
     """
-    Read jump/auth defaults from switches.yaml and switch hostnames from switches.csv (or fallback to YAML hosts).
+    Read jump/auth defaults from switches.yaml and switch hostnames from CSV (or fallback to YAML hosts).
     Automatically sanitizes hosts (strips CIDR masks like /64 and ignores header rows).
     """
     config = {}
@@ -105,43 +105,96 @@ def load_config() -> tuple[Optional[dict], list[tuple[str, dict]]]:
     return config.get("jump"), switches
 
 
-def open_ssh_client(host: str, auth: dict, sock=None) -> paramiko.SSHClient:
-    """Open and return a single SSHClient connection. Cleans up immediately if connect fails."""
+def _open_tunnel_sock(jump_client: Optional[paramiko.SSHClient], host: str, port: int):
+    """Helper to open a fresh direct-tcpip channel from the jump server."""
+    if jump_client is None:
+        return None
+    transport = jump_client.get_transport()
+    if transport is None or not transport.is_active():
+        raise RuntimeError("Jump server connection is no longer active")
+    return transport.open_channel("direct-tcpip", (host, port), ("127.0.0.1", 0), timeout=15)
+
+
+def open_ssh_client(
+    host: str,
+    auth: dict,
+    jump_client: Optional[paramiko.SSHClient] = None,
+) -> tuple[paramiko.SSHClient, Optional[Channel]]:
+    """
+    Open and return (SSHClient, sock).
+    Automatically retries with legacy ssh-rsa if YubiKey/agent rejects SHA-2 signing.
+    """
     raw_keys = auth.get("key_files") or []
     if isinstance(raw_keys, str):
         raw_keys = [raw_keys]
     key_files = [os.path.expanduser(k) for k in raw_keys]
     use_agent = auth.get("use_agent", True)
+    port = int(auth.get("port", 22))
 
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        ssh.connect(
-            host,
-            port=int(auth.get("port", 22)),
-            username=auth["username"],
-            key_filename=key_files or None,
-            passphrase=auth.get("passphrase") or None,
-            allow_agent=use_agent,
-            password=auth.get("password") or None,
-            look_for_keys=False,
-            timeout=15,
-            banner_timeout=15,
-            auth_timeout=15,
-            sock=sock,
+    # Try 1: Standard connection (or user-defined disabled_algorithms)
+    # Try 2: Force legacy ssh-rsa signatures (fixes YubiKey PKCS#11 'key cannot be used for signing')
+    attempts = [
+        auth.get("disabled_algorithms"),
+        {"pubkeys": ["rsa-sha2-512", "rsa-sha2-256"]},
+    ]
+
+    last_err = None
+    for idx, disabled_algos in enumerate(attempts):
+        sock = None
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            sock = _open_tunnel_sock(jump_client, host, port)
+            connect_kwargs = dict(
+                hostname=host,
+                port=port,
+                username=auth["username"],
+                key_filename=key_files or None,
+                passphrase=auth.get("passphrase") or None,
+                allow_agent=use_agent,
+                password=auth.get("password") or None,
+                look_for_keys=False,
+                timeout=15,
+                banner_timeout=15,
+                auth_timeout=15,
+                sock=sock,
+            )
+            if disabled_algos:
+                connect_kwargs["disabled_algorithms"] = disabled_algos
+
+            ssh.connect(**connect_kwargs)
+            transport = ssh.get_transport()
+            if transport:
+                transport.set_keepalive(10)
+            return ssh, sock
+
+        except paramiko.SSHException as e:
+            ssh.close()
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            last_err = e
+            if "key cannot be used for signing" in str(e).lower() and idx == 0:
+                print(f"{datetime.now()} 🔄 {host}: Agent rejected RSA-SHA2 signature, retrying with legacy ssh-rsa...")
+                continue
+            break
+        except Exception:
+            ssh.close()
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            raise
+
+    if last_err and "key cannot be used for signing" in str(last_err).lower():
+        print(
+            f"\n{datetime.now()} 💡 YUBIKEY AGENT LOCKED/STALE: macOS ssh-agent lost connection to your YubiKey.\n"
+            f"   Run 'ssh-add -D' in Terminal, unplug/re-insert your YubiKey, and reload it into ssh-agent.\n"
         )
-        transport = ssh.get_transport()
-        if transport:
-            transport.set_keepalive(10)
-        return ssh
-    except Exception:
-        ssh.close()
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
-        raise
+    raise last_err
 
 
 def read_until_prompt(chan: Channel, timeout: float = 15.0) -> str:
@@ -181,7 +234,7 @@ def jump_session(jump_auth: Optional[dict]) -> Iterator[Optional[paramiko.SSHCli
 
     host = jump_auth["host"]
     print(f"{datetime.now()} 🔑 Logging in to jump server {host}")
-    jump_client = open_ssh_client(host, jump_auth)
+    jump_client, _ = open_ssh_client(host, jump_auth)
     try:
         yield jump_client
     finally:
@@ -201,15 +254,7 @@ def switch_shell(host: str, auth: dict, jump_client: Optional[paramiko.SSHClient
 
     print(f"{datetime.now()} 🔑 Logging in to {host}")
     try:
-        if jump_client is not None:
-            transport = jump_client.get_transport()
-            if transport is None or not transport.is_active():
-                raise RuntimeError("Jump server connection is no longer active")
-            sock = transport.open_channel(
-                "direct-tcpip", (host, int(auth.get("port", 22))), ("127.0.0.1", 0), timeout=15
-            )
-
-        client = open_ssh_client(host, auth, sock=sock)
+        client, sock = open_ssh_client(host, auth, jump_client=jump_client)
         chan = client.invoke_shell()
         chan.settimeout(30)
 
