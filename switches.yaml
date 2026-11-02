@@ -7,3 +7,9 @@ jump:
   host: 10.0.0.1
   username: your_jump_username
   use_agent: true
+
+# NX-OS on-box scheduler (MAC-CLEAR job / MAC-CLEAR-DAILY schedule)
+scheduler:
+  time: "04:05"          # Switch local time, HH:MM 24h (check 'show clock'). Stagger vPC peers.
+  aaa_password: ""       # Only if you log in via TACACS+/RADIUS: the job runs as your user and
+                         # needs 'scheduler aaa-authentication'. Leave "" for local users.

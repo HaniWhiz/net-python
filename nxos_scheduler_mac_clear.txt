@@ -1,0 +1,47 @@
+NX-OS on-box scheduler: daily dynamic MAC clear (manual paste version)
+======================================================================
+This is exactly what clear-dmac-schedule.py pushes.
+
+Why the old version was wrong:
+- Job commands cannot be edited on NX-OS. Entering "scheduler job name MAC-CLEAR"
+  again on an existing job APPENDS the new commands, so every re-run duplicated
+  the whole job (MAC cleared several times, history file lines doubled).
+  Fix: delete the schedule + job first, then recreate both.
+- With TACACS+/RADIUS logins the job runs as your user and fails silently
+  without "scheduler aaa-authentication".
+- Nothing verified the result before "copy run start".
+
+Config (errors on the two "no ..." lines are fine if they did not exist yet):
+
+configure terminal
+feature scheduler
+scheduler logfile size 1024
+! only if you log in via TACACS+/RADIUS:
+! scheduler aaa-authentication password 0 <your login password>
+no scheduler schedule name MAC-CLEAR-DAILY
+no scheduler job name MAC-CLEAR
+scheduler job name MAC-CLEAR
+show clock >> bootflash:mac_clear_history.txt
+show mac address-table count >> bootflash:mac_clear_history.txt
+clear mac address-table dynamic
+show mac address-table count >> bootflash:mac_clear_history.txt
+exit
+scheduler schedule name MAC-CLEAR-DAILY
+job name MAC-CLEAR
+time daily 04:05
+exit
+end
+
+Verify (job must list "clear mac address-table dynamic" exactly ONCE):
+
+show scheduler job name MAC-CLEAR
+show scheduler schedule name MAC-CLEAR-DAILY
+copy running-config startup-config
+
+After the first run:
+
+show scheduler logfile
+show file bootflash:mac_clear_history.txt
+
+If "show clock >> ..." is rejected in job mode (older N3K releases only document ">"),
+use only "clear mac address-table dynamic" inside the job.

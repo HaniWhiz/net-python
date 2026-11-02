@@ -1,5 +1,6 @@
 import csv
 import os
+import re
 import signal
 import sys
 import time
@@ -12,23 +13,26 @@ import paramiko
 import yaml
 from paramiko.channel import Channel
 
-SCHEDULER_COMMANDS = [
-    "configure terminal",
-    "feature scheduler",
-    "scheduler logfile size 1024",
-    "scheduler job name MAC-CLEAR",
-    "show clock >> bootflash:mac_clear_history.txt",
-    "show mac address-table count >> bootflash:mac_clear_history.txt",
-    "clear mac address-table dynamic",
-    "show mac address-table count >> bootflash:mac_clear_history.txt",
-    "exit",
-    "scheduler schedule name MAC-CLEAR-DAILY",
-    "job name MAC-CLEAR",
-    "time daily 04:05",
-    "exit",
-    "end",
-    "copy running-config startup-config",
-]
+# ---------------------------------------------------------------------------
+# NX-OS scheduler settings
+# ---------------------------------------------------------------------------
+JOB_NAME = "MAC-CLEAR"
+SCHEDULE_NAME = "MAC-CLEAR-DAILY"
+HISTORY_FILE = "bootflash:mac_clear_history.txt"
+DEFAULT_TIME = "04:05"          # Switch local time (check with 'show clock')
+CLEAR_CMD = "clear mac address-table dynamic"
+
+
+def job_commands(with_history: bool) -> list[str]:
+    """Commands stored inside the scheduler job (entered one per line in config-job mode)."""
+    if not with_history:
+        return [CLEAR_CMD]
+    return [
+        f"show clock >> {HISTORY_FILE}",
+        f"show mac address-table count >> {HISTORY_FILE}",
+        CLEAR_CMD,
+        f"show mac address-table count >> {HISTORY_FILE}",
+    ]
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "switches.yaml"   # Jump server & default login settings
@@ -49,18 +53,33 @@ def verify_ssh_agent() -> None:
         agent.close()
 
 
-def load_config() -> tuple[dict | None, list[tuple[str, dict]]]:
+def load_config() -> tuple[dict | None, list[tuple[str, dict]], dict]:
     """
-    Read jump/auth defaults from switches.yaml and switch hostnames from CSV (or fallback to YAML hosts).
-    Strictly deduplicates hosts so the script never connects to the same switch twice.
+    Read jump/auth/scheduler settings from switches.yaml and switch hostnames from CSV
+    (or fall back to the YAML 'hosts' list). Hosts are deduplicated so the script never
+    connects to the same switch twice. Per-host settings in YAML override 'auth'.
     """
     config = {}
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
     defaults = config.get("auth") or {}
+    if not defaults.get("username"):
+        raise ValueError(
+            f"Missing 'username' in {CONFIG_FILE.name}. Please set 'username' under the 'auth' section."
+        )
 
-    raw_hosts = []
+    sched = config.get("scheduler") or {}
+    sched_time = str(sched.get("time") or DEFAULT_TIME).strip()
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", sched_time)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise ValueError(f"Invalid scheduler time '{sched_time}' in {CONFIG_FILE.name}. Use HH:MM (24h).")
+    sched_settings = {
+        "time": f"{int(m.group(1)):02d}:{m.group(2)}",
+        "aaa_password": str(sched.get("aaa_password") or ""),
+    }
+
+    raw_hosts: list[tuple[str, dict]] = []
     if CSV_FILE.exists():
         with open(CSV_FILE, mode="r", encoding="utf-8-sig", newline="") as f:
             sample = f.read(2048)
@@ -69,26 +88,26 @@ def load_config() -> tuple[dict | None, list[tuple[str, dict]]]:
                 dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
             except csv.Error:
                 dialect = csv.excel
-            reader = csv.reader(f, dialect)
-            for row in reader:
+            for row in csv.reader(f, dialect):
                 if row and row[0].strip():
-                    raw_hosts.append(row[0].strip())
+                    raw_hosts.append((row[0].strip(), {}))
     else:
         for entry in config.get("hosts") or []:
             if isinstance(entry, str):
-                raw_hosts.append(entry.strip())
+                raw_hosts.append((entry.strip(), {}))
             elif isinstance(entry, dict) and "host" in entry:
-                raw_hosts.append(str(entry["host"]).strip())
+                overrides = {k: v for k, v in entry.items() if k != "host"}
+                raw_hosts.append((str(entry["host"]).strip(), overrides))
 
     ignored_words = ("ip", "address", "hostname", "host", "switch", "device", "ip address")
     switches: list[tuple[str, dict]] = []
     seen_hosts: set[str] = set()
 
-    for raw in raw_hosts:
+    for raw, overrides in raw_hosts:
         if not raw or raw.startswith("#"):
             continue
 
-        # Strip CIDR mask (e.g., /64) if present
+        # Strip CIDR mask (e.g., /24) if present
         host = raw.split("/")[0].strip()
 
         # Skip header labels and duplicate entries
@@ -96,14 +115,9 @@ def load_config() -> tuple[dict | None, list[tuple[str, dict]]]:
             continue
 
         seen_hosts.add(host)
-        merged_auth = {**defaults}
-        if not merged_auth.get("username"):
-            raise ValueError(
-                f"Missing 'username' in {CONFIG_FILE.name}. Please set 'username' under the 'auth' section."
-            )
-        switches.append((host, merged_auth))
+        switches.append((host, {**defaults, **overrides}))
 
-    return config.get("jump"), switches
+    return config.get("jump"), switches, sched_settings
 
 
 def open_ssh_client(host: str, auth: dict, sock=None) -> paramiko.SSHClient:
@@ -260,79 +274,144 @@ def switch_shell(host: str, auth: dict, jump_client: paramiko.SSHClient | None) 
 
 
 def _has_cli_error(output: str) -> bool:
-    """Return True if output contains a Cisco CLI error message."""
-    return any(
-        line.strip().startswith("%")
-        or "% invalid" in line.lower()
-        or "syntax error" in line.lower()
-        for line in output.splitlines()
-    )
+    """Return True if output contains an NX-OS CLI error message."""
+    for line in output.splitlines():
+        low = line.strip().lower()
+        if (
+            low.startswith("%")
+            or low.startswith("error:")
+            or "invalid command" in low
+            or "invalid input" in low
+            or "syntax error" in low
+            or "incomplete command" in low
+        ):
+            return True
+    return False
 
 
-def clear_mac_table(chan: Channel, host: str) -> None:
+def run_cmd(chan: Channel, cmd: str, timeout: float = 15.0, log_cmd: str | None = None) -> tuple[bool, str]:
+    """
+    Send one command and wait for the prompt.
+    Returns (ok, output). ok is False on a CLI error or if no '#' prompt came back.
+    """
+    chan.send(cmd + "\n")
+    output = read_until_prompt(chan, timeout=timeout)
+
+    lower_out = output.lower()
+    if "[confirm]" in lower_out or "destination filename" in lower_out:
+        chan.send("\n")
+        output += read_until_prompt(chan, timeout=timeout)
+
+    if log_cmd is not None:
+        output = output.replace(cmd, log_cmd)
+
+    ok = not _has_cli_error(output) and output.strip().endswith("#")
+    return ok, output
+
+
+def _strip_echo(output: str, cmd: str) -> str:
+    """Remove the echoed command line and trailing prompt so only real output is checked."""
+    lines = [ln for ln in output.splitlines() if cmd not in ln]
+    if lines and lines[-1].strip().endswith("#"):
+        lines = lines[:-1]
+    return "\n".join(lines)
+
+
+def clear_mac_table(chan: Channel, host: str, sched: dict) -> None:
     # Small pause + flush so any trailing login prompt bytes are cleared
     time.sleep(0.3)
     while chan.recv_ready():
         chan.recv(99999)
 
+    # Disable paging so 'show scheduler ...' output is not cut by --More--
+    run_cmd(chan, "terminal length 0")
+
     # 1. Immediate dynamic MAC clear
-    chan.send("clear mac address-table dynamic" + "\n")
-    output = read_until_prompt(chan, timeout=15.0)
-
-    if "[confirm]" in output.lower():
-        chan.send("\n")
-        output += read_until_prompt(chan, timeout=10.0)
-
-    if "% invalid" in output.lower():
-        alt_cmd = "clear mac-address-table dynamic"
-        chan.send(alt_cmd + "\n")
-        alt_output = read_until_prompt(chan, timeout=15.0)
-        if not _has_cli_error(alt_output) and alt_output.strip().endswith("#"):
-            print(f"{datetime.now()} ✅ Dynamic MAC address table cleared on {host} (via '{alt_cmd}')")
-        else:
-            output += "\n" + alt_output
-            print(f"{datetime.now()} ❌ {host} did not accept 'clear mac address-table dynamic':\n{output.strip()}")
-            return
-    elif _has_cli_error(output) or not output.strip().endswith("#"):
-        print(f"{datetime.now()} ❌ {host} did not accept 'clear mac address-table dynamic':\n{output.strip()}")
+    ok, output = run_cmd(chan, CLEAR_CMD)
+    if not ok:
+        print(f"{datetime.now()} ❌ {host} did not accept '{CLEAR_CMD}':\n{output.strip()}")
         return
-    else:
-        print(f"{datetime.now()} ✅ Dynamic MAC address table cleared on {host}")
+    print(f"{datetime.now()} ✅ Dynamic MAC address table cleared on {host}")
 
-    # 2. Configure NX-OS Scheduler (handles both 3K switch sets automatically)
-    redirect_supported = True
+    # 2. Configure the NX-OS scheduler (idempotent: old job/schedule are removed first)
+    def fail(cmd: str, out: str) -> None:
+        print(f"{datetime.now()} ❌ {host} did not accept '{cmd}':\n{out.strip()}")
+        run_cmd(chan, "end")
 
-    for cmd in SCHEDULER_COMMANDS:
-        # If this switch rejected 'show clock >> ...', skip remaining '>>' lines cleanly
-        if ">>" in cmd and not redirect_supported:
+    for cmd in ("configure terminal", "feature scheduler", "scheduler logfile size 1024"):
+        ok, out = run_cmd(chan, cmd)
+        if not ok:
+            return fail(cmd, out)
+
+    # Needed when you log in with TACACS+/RADIUS: the job runs as the user who created it
+    if sched["aaa_password"]:
+        cmd = f"scheduler aaa-authentication password 0 {sched['aaa_password']}"
+        ok, out = run_cmd(chan, cmd, log_cmd="scheduler aaa-authentication password 0 ******")
+        if not ok:
+            return fail("scheduler aaa-authentication password 0 ******", out)
+
+    # Job commands cannot be edited on NX-OS. Re-entering an existing job APPENDS
+    # commands, so delete schedule + job first. Errors here just mean "did not exist".
+    run_cmd(chan, f"no scheduler schedule name {SCHEDULE_NAME}")
+    run_cmd(chan, f"no scheduler job name {JOB_NAME}")
+
+    cmd = f"scheduler job name {JOB_NAME}"
+    ok, out = run_cmd(chan, cmd)
+    if not ok:
+        return fail(cmd, out)
+
+    with_history = True
+    for job_cmd in job_commands(with_history=True):
+        if ">>" in job_cmd and not with_history:
             continue
-
-        cmd_timeout = 60.0 if cmd.startswith("copy ") else 15.0
-        chan.send(cmd + "\n")
-        cmd_output = read_until_prompt(chan, timeout=cmd_timeout)
-
-        lower_out = cmd_output.lower()
-        if "[confirm]" in lower_out or "destination filename" in lower_out:
-            chan.send("\n")
-            cmd_output += read_until_prompt(chan, timeout=cmd_timeout)
-
-        # If a switch does not support '>>' file redirection in job mode, skip redirection without failing
-        if ">>" in cmd and _has_cli_error(cmd_output):
-            redirect_supported = False
-            print(f"{datetime.now()} ℹ️  {host} does not support '>>' redirection in job mode; configuring job with clear command only.")
+        ok, out = run_cmd(chan, job_cmd)
+        if not ok and ">>" in job_cmd and job_cmd.startswith("show clock"):
+            # First '>>' line rejected: this release has no '>>' in job mode. Use clear only.
+            with_history = False
+            print(f"{datetime.now()} ℹ️  {host} does not support '>>' in scheduler jobs; job will only run '{CLEAR_CMD}'.")
             continue
+        if not ok:
+            return fail(job_cmd, out)
 
-        # Fallback inside job mode if 'clear mac address-table dynamic' requires hyphenated syntax
-        if cmd == "clear mac address-table dynamic" and "% invalid" in cmd_output.lower():
-            alt_cmd = "clear mac-address-table dynamic"
-            chan.send(alt_cmd + "\n")
-            cmd_output = read_until_prompt(chan, timeout=cmd_timeout)
+    for cmd in (
+        "exit",
+        f"scheduler schedule name {SCHEDULE_NAME}",
+        f"job name {JOB_NAME}",
+        f"time daily {sched['time']}",
+        "exit",
+        "end",
+    ):
+        ok, out = run_cmd(chan, cmd)
+        if not ok:
+            return fail(cmd, out)
 
-        if _has_cli_error(cmd_output) or not cmd_output.strip().endswith("#"):
-            print(f"{datetime.now()} ❌ {host} did not accept '{cmd}':\n{cmd_output.strip()}")
-            return
+    # 3. Verify what the switch actually stored before saving
+    cmd = f"show scheduler job name {JOB_NAME}"
+    ok, out = run_cmd(chan, cmd)
+    job_out = _strip_echo(out, cmd)
+    clear_count = job_out.lower().count(CLEAR_CMD)
+    if not ok or clear_count != 1:
+        print(f"{datetime.now()} ❌ {host}: job '{JOB_NAME}' check failed "
+              f"(found '{CLEAR_CMD}' {clear_count} time(s), expected 1):\n{out.strip()}")
+        return
 
-    print(f"{datetime.now()} ✅ Scheduler 'MAC-CLEAR-DAILY' (04:05) configured and config saved on {host}")
+    cmd = f"show scheduler schedule name {SCHEDULE_NAME}"
+    ok, out = run_cmd(chan, cmd)
+    sched_out = _strip_echo(out, cmd)
+    if not ok or SCHEDULE_NAME not in sched_out or JOB_NAME not in sched_out.replace(SCHEDULE_NAME, ""):
+        print(f"{datetime.now()} ❌ {host}: schedule '{SCHEDULE_NAME}' is missing or has no job attached:\n{out.strip()}")
+        return
+
+    # 4. Save config
+    cmd = "copy running-config startup-config"
+    ok, out = run_cmd(chan, cmd, timeout=90.0)
+    if not ok or "copy complete" not in out.lower():
+        print(f"{datetime.now()} ❌ {host}: '{cmd}' did not complete:\n{out.strip()}")
+        return
+
+    note = "" if with_history else " (no history file)"
+    print(f"{datetime.now()} ✅ Scheduler '{SCHEDULE_NAME}' ({sched['time']} switch time) "
+          f"configured, verified and saved on {host}{note}")
 
 
 def _handle_sigterm(signum, frame):
@@ -348,10 +427,14 @@ def main() -> None:
     verify_ssh_agent()
 
     try:
-        jump_auth, switches = load_config()
+        jump_auth, switches, sched = load_config()
     except Exception as e:
         print(f"{datetime.now()} 📢 Configuration error: {type(e).__name__}: {e}")
         sys.exit(1)
+
+    if not sched["aaa_password"]:
+        print(f"{datetime.now()} ℹ️  No 'scheduler.aaa_password' set. If you log in via TACACS+/RADIUS, "
+              "the job will fail at run time (check 'show scheduler logfile').")
 
     if not switches:
         print(f"{datetime.now()} ⚠️  No valid switches found. Check your CSV or YAML file. Exiting.")
@@ -362,7 +445,7 @@ def main() -> None:
             for host, auth in switches:
                 try:
                     with switch_shell(host, auth, jump_client) as chan:
-                        clear_mac_table(chan, host)
+                        clear_mac_table(chan, host, sched)
                 except Exception as e:
                     print(f"{datetime.now()} 📢 {host} failed: {type(e).__name__}: {e}")
     except Exception as e:
