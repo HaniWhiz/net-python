@@ -1,0 +1,48 @@
+# ============================================================================
+# net-push.txt - commands for net-push.py
+#
+# One command per line, sent in this order to every switch.
+# Empty lines and lines starting with '#' or '!' are skipped.
+#
+# Options go at the end of a line after '##', separated by commas:
+#   ignore_errors        an error from this command does not stop the run
+#   timeout=90           this command may take longer (seconds)
+#   expect=Copy complete this text must be in the output
+#   answer=y             reply if the switch asks (y/n) or [confirm]
+#   show                 print the output on screen
+#   secret               hide the command (passwords) in output and logs
+#
+# Without 'answer', [confirm] gets ENTER and a (y/n) question gets 'n' and fails.
+#
+# Example below: NX-OS scheduler that clears the dynamic MAC table every day.
+# ============================================================================
+
+clear mac address-table dynamic
+
+configure terminal
+feature scheduler
+scheduler logfile size 1024
+
+# Only for TACACS+/RADIUS logins (the job runs as your user):
+# scheduler aaa-authentication password 0 YOUR_PASSWORD      ## secret
+
+# A job cannot be edited on NX-OS: delete it first, then build it again.
+no scheduler schedule name MAC-CLEAR-DAILY                   ## ignore_errors
+no scheduler job name MAC-CLEAR                              ## ignore_errors
+
+scheduler job name MAC-CLEAR
+show clock >> bootflash:mac_clear_history.txt
+show mac address-table count >> bootflash:mac_clear_history.txt
+clear mac address-table dynamic
+show mac address-table count >> bootflash:mac_clear_history.txt
+exit
+
+scheduler schedule name MAC-CLEAR-DAILY
+job name MAC-CLEAR
+time daily 04:05
+exit
+end
+
+show scheduler job name MAC-CLEAR                            ## show, expect=clear mac address-table dynamic
+show scheduler schedule name MAC-CLEAR-DAILY                 ## show, expect=MAC-CLEAR
+copy running-config startup-config                           ## timeout=90, expect=Copy complete
