@@ -1,5 +1,5 @@
 # ============================================================================
-# net-deploy.txt - commands for net-deploy.py
+# net-push.txt - commands for net-push.py
 #
 # One command per line, sent in this order to every switch.
 # Empty lines and lines starting with '#' or '!' are skipped.

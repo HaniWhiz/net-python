@@ -1,0 +1,58 @@
+# ============================================================================
+# net-push.yaml - job file for net-push.py
+#
+# Login, jump server, the input CSV file name and the commands file name.
+# The commands themselves are in the .txt file named by 'commands_file'.
+# Copy this file (and the .txt) for every new purpose and run:
+#
+#     python net-push.py -c my-job.yaml --dry-run     # preview, sends nothing
+#     python net-push.py -c my-job.yaml
+# ============================================================================
+
+name: mac-clear-scheduler        # Used in the output and in log file names
+
+# ---------------------------------------------------------------------------
+# Login to the switches
+# ---------------------------------------------------------------------------
+auth:
+  username: your_cisco_username
+  use_agent: true                # Use ssh-agent keys (YubiKey)
+  # port: 22
+  # key_files: ['~/.ssh/id_ed25519']
+  # passphrase: ""
+  # password: ""                 # Plain text. Keep this file private if you use it.
+
+# ---------------------------------------------------------------------------
+# Jump server. Delete or comment out the whole block to connect directly.
+# ---------------------------------------------------------------------------
+jump:
+  host: 10.0.0.1
+  username: your_jump_username
+  use_agent: true
+
+# ---------------------------------------------------------------------------
+# Switches
+#   hosts_csv : CSV file, first column = IP or hostname. Path is relative to
+#               this YAML file. Header rows, '#' lines and duplicates are skipped.
+#   hosts     : extra switches written here. Both can be used together.
+# ---------------------------------------------------------------------------
+hosts_csv: forough.csv
+
+# hosts:
+#   - 10.0.0.11
+#   - host: 10.0.0.13            # per-switch login override
+#     username: netops
+
+# ---------------------------------------------------------------------------
+# Commands file: one command per line. Path is relative to this YAML file.
+# ---------------------------------------------------------------------------
+commands_file: net-push.txt
+
+# ---------------------------------------------------------------------------
+# Run settings
+# ---------------------------------------------------------------------------
+settings:
+  command_timeout: 15            # Seconds to wait for the prompt after each command
+  stop_on_error: true            # true = stop that switch at the first failed command
+  disable_paging: true           # Send 'terminal length 0' first
+  log_dir: ""                    # e.g. "logs" = save the full session of every switch
