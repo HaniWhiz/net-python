@@ -139,3 +139,56 @@ show file bootflash:mac_clear_history.txt
 - همهٔ سوییچ‌ها در یک لحظه پاک‌سازی می‌کنند. برای vPC peerها یا سوییچ‌های حساس، ساعت متفاوت بگذارید (مثلاً اسکریپت را با `time` متفاوت برای هر گروه اجرا کنید).
 - فایل تاریخچه هر روز چند خط بزرگ‌تر می‌شود. گاهی آن را پاک کنید. scheduler log حداکثر 1024 KB است.
 - رمزها در `switches.yaml` متن ساده‌اند. این فایل را خصوصی نگه دارید و رمز واقعی را در GitHub نگذارید.
+
+---
+
+# اسکریپت عمومی: `net-deploy.py` + `net-deploy.yaml`
+
+برای هر کار دیگری (نه فقط MAC clear) از این جفت استفاده کنید. در فایل `.py` هیچ دستور Cisco یا نام فایلی نوشته نشده است. همه چیز در فایل YAML است: تنظیمات ورود، Jump Server، فایل CSV ورودی و دستورهایی که باید روی سوییچ‌ها اجرا شوند.
+
+برای هر کار جدید، `net-deploy.yaml` را کپی کنید، دستورها و CSV را عوض کنید و اجرا کنید:
+
+```bash
+python net-deploy.py                          # از net-deploy.yaml کنار اسکریپت استفاده می‌کند
+python net-deploy.py -c vlan-job.yaml --dry-run   # فقط نمایش سوییچ‌ها و دستورها، چیزی فرستاده نمی‌شود
+python net-deploy.py -c vlan-job.yaml
+```
+
+## بخش‌های فایل YAML
+
+| بخش | معنی |
+| --- | --- |
+| `name` | نام کار. در خروجی و نام فایل‌های log استفاده می‌شود |
+| `auth` | ورود به سوییچ‌ها (`username`، `use_agent`، `key_files`، `password`، `port`) |
+| `jump` | Jump Server. اگر ندارید کل بخش را پاک کنید |
+| `hosts_csv` | فایل CSV ورودی. ستون اول IP یا hostname. مسیر نسبت به خود فایل YAML است |
+| `hosts` | سوییچ‌های اضافه که داخل YAML نوشته می‌شوند. می‌تواند همراه `hosts_csv` باشد |
+| `settings` | `command_timeout`، `stop_on_error`، `disable_paging`، `log_dir` |
+| `commands` | دستورها، به همان ترتیب روی هر سوییچ فرستاده می‌شوند |
+
+## دستورها
+
+هر دستور یا یک خط ساده است، یا یک بلوک با گزینه:
+
+```yaml
+commands:
+  - configure terminal
+  - cmd: no scheduler job name MAC-CLEAR
+    ignore_errors: true          # خطای این دستور کار را متوقف نمی‌کند
+  - cmd: show vlan brief
+    show: true                   # خروجی روی صفحه چاپ شود
+  - cmd: copy running-config startup-config
+    timeout: 90                  # این دستور بیشتر طول می‌کشد
+    expect: Copy complete        # این متن باید در خروجی باشد
+  - cmd: username test password 0 MyPass
+    secret: true                 # دستور در خروجی و log مخفی می‌شود
+  - cmd: reload in 10
+    answer: "y"                  # جواب سؤال (y/n) یا [confirm]
+```
+
+- اگر دستوری خطا بدهد، همان سوییچ متوقف می‌شود (`stop_on_error: true`) و اسکریپت با `end` از config mode خارج می‌شود. بقیهٔ سوییچ‌ها ادامه پیدا می‌کنند.
+- اگر `answer` ننویسید: برای `[confirm]` فقط Enter فرستاده می‌شود. برای سؤال `(y/n)` جواب `n` فرستاده می‌شود و دستور خطا حساب می‌شود، تا چیزی بدون اجازهٔ شما تأیید نشود.
+- در آخر خلاصهٔ OK / FAILED چاپ می‌شود. اگر سوییچی خطا داشته باشد، exit code برابر `1` است.
+- با `log_dir: logs` خروجی کامل هر سوییچ در یک فایل ذخیره می‌شود.
+
+`net-deploy.yaml` نمونه همان MAC-CLEAR scheduler را دارد. تفاوت با `clear-dmac-schedule.py`: اسکریپت عمومی اگر سوییچی `>>` را قبول نکند خودش job را بدون فایل تاریخچه نمی‌سازد و روی همان دستور متوقف می‌شود.

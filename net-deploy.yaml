@@ -1,0 +1,109 @@
+# ============================================================================
+# net-deploy.yaml - job file for net-deploy.py
+#
+# Everything a run needs is in this file: login, jump server, the input CSV
+# and the commands. Copy this file for every new purpose and run:
+#
+#     python net-deploy.py -c my-job.yaml --dry-run     # preview, sends nothing
+#     python net-deploy.py -c my-job.yaml
+# ============================================================================
+
+name: mac-clear-scheduler        # Used in the output and in log file names
+
+# ---------------------------------------------------------------------------
+# Login to the switches
+# ---------------------------------------------------------------------------
+auth:
+  username: your_cisco_username
+  use_agent: true                # Use ssh-agent keys (YubiKey)
+  # port: 22
+  # key_files: ['~/.ssh/id_ed25519']
+  # passphrase: ""
+  # password: ""                 # Plain text. Keep this file private if you use it.
+
+# ---------------------------------------------------------------------------
+# Jump server. Delete or comment out the whole block to connect directly.
+# ---------------------------------------------------------------------------
+jump:
+  host: 10.0.0.1
+  username: your_jump_username
+  use_agent: true
+
+# ---------------------------------------------------------------------------
+# Switches
+#   hosts_csv : CSV file, first column = IP or hostname. Path is relative to
+#               this YAML file. Header rows, '#' lines and duplicates are skipped.
+#   hosts     : extra switches written here. Both can be used together.
+# ---------------------------------------------------------------------------
+hosts_csv: forough.csv
+
+# hosts:
+#   - 10.0.0.11
+#   - host: 10.0.0.13            # per-switch login override
+#     username: netops
+
+# ---------------------------------------------------------------------------
+# Run settings
+# ---------------------------------------------------------------------------
+settings:
+  command_timeout: 15            # Seconds to wait for the prompt after each command
+  stop_on_error: true            # true = stop that switch at the first failed command
+  disable_paging: true           # Send 'terminal length 0' first
+  log_dir: ""                    # e.g. "logs" = save the full session of every switch
+
+# ---------------------------------------------------------------------------
+# Commands, sent in this order to every switch.
+#
+# A command is either one text line, or a block with options:
+#   - cmd: "..."                 # the command
+#     ignore_errors: true        # an error from this command does not stop the run
+#     timeout: 90                # this command may take longer
+#     expect: "Copy complete"    # this text must be in the output (list allowed)
+#     answer: "y"                # reply if the switch asks (y/n) or [confirm]
+#     show: true                 # print the output on screen
+#     secret: true               # hide the command (passwords) in output and logs
+#
+# Without 'answer', [confirm] gets ENTER and a (y/n) question gets 'n' and fails.
+#
+# Example below: NX-OS scheduler that clears the dynamic MAC table every day.
+# ---------------------------------------------------------------------------
+commands:
+  - clear mac address-table dynamic
+
+  - configure terminal
+  - feature scheduler
+  - scheduler logfile size 1024
+
+  # Only for TACACS+/RADIUS logins (the job runs as your user):
+  # - cmd: scheduler aaa-authentication password 0 YOUR_PASSWORD
+  #   secret: true
+
+  # A job cannot be edited on NX-OS: delete it first, then build it again.
+  - cmd: no scheduler schedule name MAC-CLEAR-DAILY
+    ignore_errors: true
+  - cmd: no scheduler job name MAC-CLEAR
+    ignore_errors: true
+
+  - scheduler job name MAC-CLEAR
+  - show clock >> bootflash:mac_clear_history.txt
+  - show mac address-table count >> bootflash:mac_clear_history.txt
+  - clear mac address-table dynamic
+  - show mac address-table count >> bootflash:mac_clear_history.txt
+  - exit
+
+  - scheduler schedule name MAC-CLEAR-DAILY
+  - job name MAC-CLEAR
+  - time daily 04:05
+  - exit
+  - end
+
+  - cmd: show scheduler job name MAC-CLEAR
+    expect: clear mac address-table dynamic
+    show: true
+  - cmd: show scheduler schedule name MAC-CLEAR-DAILY
+    expect: MAC-CLEAR
+    show: true
+
+  - cmd: copy running-config startup-config
+    timeout: 90
+    expect: Copy complete
