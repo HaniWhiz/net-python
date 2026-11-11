@@ -1,8 +1,9 @@
 """
 net-deploy.py - general purpose command deployer for Cisco switches (NX-OS / IOS).
 
-Nothing device-specific lives in this file. The login settings, jump server,
-input CSV file and the commands to deploy are all read from a YAML job file.
+Nothing device-specific lives in this file:
+  - net-deploy.yaml : login, jump server, name of the input CSV, name of the commands file
+  - net-deploy.txt  : the commands to deploy, one per line
 
     python net-deploy.py                      # uses net-deploy.yaml next to this script
     python net-deploy.py -c vlan-job.yaml     # any other job file
@@ -62,30 +63,69 @@ def _read_csv_hosts(csv_path: Path) -> list[str]:
         return [row[0].strip() for row in csv.reader(f, dialect) if row and row[0].strip()]
 
 
-def _parse_commands(raw_commands, default_timeout: float) -> list[dict]:
+OPTION_KEYS = ("ignore_errors", "show", "secret", "timeout", "expect", "answer")
+# Splits 'timeout=90, expect=Copy complete' at commas that start a new option
+OPTION_SPLIT_RE = re.compile(r",\s*(?=(?:%s)\b)" % "|".join(OPTION_KEYS))
+
+
+def _parse_options(text: str, where: str) -> dict:
+    """Parse the part after '##' on a command line, e.g. 'timeout=90, expect=Copy complete'."""
+    options: dict = {}
+    for part in OPTION_SPLIT_RE.split(text.strip()):
+        part = part.strip()
+        if not part:
+            continue
+        key, sep, value = part.partition("=")
+        key, value = key.strip(), value.strip()
+        if key not in OPTION_KEYS:
+            raise ValueError(f"{where}: unknown option '{key}'. Allowed: {', '.join(OPTION_KEYS)}")
+        if key in ("ignore_errors", "show", "secret"):
+            if sep and value.lower() not in ("true", "yes", "false", "no"):
+                raise ValueError(f"{where}: '{key}' takes no value (or true/false)")
+            options[key] = not sep or value.lower() in ("true", "yes")
+        elif not sep or not value:
+            raise ValueError(f"{where}: option '{key}' needs a value, e.g. {key}=...")
+        elif key == "timeout":
+            try:
+                options[key] = float(value)
+            except ValueError:
+                raise ValueError(f"{where}: timeout must be a number of seconds") from None
+        elif key == "expect":
+            options.setdefault("expect", []).append(value)
+        else:
+            options[key] = value
+    return options
+
+
+def load_commands(commands_file: Path, default_timeout: float) -> list[dict]:
+    """
+    Read the commands file: one command per line, sent in that order.
+    Empty lines and lines starting with '#' or '!' are skipped.
+    Options go after '##' at the end of a line.
+    """
     commands: list[dict] = []
-    for i, item in enumerate(raw_commands or [], start=1):
-        if isinstance(item, str):
-            item = {"cmd": item}
-        if not isinstance(item, dict) or not str(item.get("cmd") or "").strip():
-            raise ValueError(f"commands[{i}] must be a text line or a block with 'cmd:'")
-        unknown = set(item) - {"cmd", "ignore_errors", "timeout", "expect", "answer", "show", "secret"}
-        if unknown:
-            raise ValueError(f"commands[{i}] has unknown option(s): {', '.join(sorted(unknown))}")
-        expect = item.get("expect") or []
-        if isinstance(expect, str):
-            expect = [expect]
-        commands.append({
-            "cmd": str(item["cmd"]).strip(),
-            "ignore_errors": bool(item.get("ignore_errors", False)),
-            "timeout": float(item.get("timeout") or default_timeout),
-            "expect": [str(e) for e in expect],
-            "answer": None if item.get("answer") is None else str(item["answer"]),
-            "show": bool(item.get("show", False)),
-            "secret": bool(item.get("secret", False)),
-        })
+    with open(commands_file, encoding="utf-8-sig") as f:
+        for line_no, line in enumerate(f, start=1):
+            text = line.strip()
+            if not text or text.startswith(("#", "!")):
+                continue
+            where = f"{commands_file.name} line {line_no}"
+            cmd, _, option_text = text.partition("##")
+            cmd = cmd.strip()
+            if not cmd:
+                raise ValueError(f"{where}: no command before '##'")
+            opts = _parse_options(option_text, where)
+            commands.append({
+                "cmd": cmd,
+                "ignore_errors": opts.get("ignore_errors", False),
+                "timeout": opts.get("timeout", default_timeout),
+                "expect": opts.get("expect", []),
+                "answer": opts.get("answer"),
+                "show": opts.get("show", False),
+                "secret": opts.get("secret", False),
+            })
     if not commands:
-        raise ValueError("No commands found. Add them under 'commands:' in the job file.")
+        raise ValueError(f"No commands found in {commands_file.name}.")
     return commands
 
 
@@ -137,12 +177,22 @@ def load_job(job_file: Path) -> dict:
         seen.add(host)
         switches.append((host, {**defaults, **overrides}))
 
+    if config.get("commands"):
+        raise ValueError("Commands no longer go in the YAML. Put them in the file named by 'commands_file'.")
+    commands_file = config.get("commands_file")
+    if not commands_file:
+        raise ValueError("Missing 'commands_file' (the .txt file with the commands).")
+    commands_path = _resolve(commands_file, job_dir)
+    if not commands_path.exists():
+        raise FileNotFoundError(f"commands_file not found: {commands_path}")
+
     return {
         "name": str(config.get("name") or job_file.stem),
         "jump": config.get("jump"),
         "switches": switches,
         "settings": settings,
-        "commands": _parse_commands(config.get("commands"), settings["command_timeout"]),
+        "commands_file": commands_path,
+        "commands": load_commands(commands_path, settings["command_timeout"]),
     }
 
 
@@ -350,7 +400,7 @@ def run_command(chan: Channel, command: dict) -> tuple[bool, str, str]:
         elif YES_NO_RE.search(last_line):
             # Never guess 'yes' on the user's behalf
             reply = "n"
-            reason = "switch asked a yes/no question and the command has no 'answer:' (replied 'n')"
+            reason = "switch asked a yes/no question and the command has no 'answer=' option (replied 'n')"
         else:
             reply = ""                                  # plain ENTER for [confirm] / filename
         chan.send(reply + "\n")
@@ -437,7 +487,7 @@ def _handle_signal(signum, frame):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Deploy the commands of a YAML job file to Cisco switches.")
+    parser = argparse.ArgumentParser(description="Deploy the commands of a .txt file to Cisco switches.")
     parser.add_argument("-c", "--config", default=str(DEFAULT_JOB_FILE),
                         help="YAML job file (default: net-deploy.yaml next to this script)")
     parser.add_argument("--dry-run", action="store_true",
@@ -455,7 +505,8 @@ def main() -> int:
         log("⚠️  No switches found. Set 'hosts_csv' or 'hosts' in the job file.")
         return 2
 
-    log(f"📋 Job '{job['name']}': {len(job['commands'])} command(s) for {len(switches)} switch(es)")
+    log(f"📋 Job '{job['name']}': {len(job['commands'])} command(s) from {job['commands_file'].name} "
+        f"for {len(switches)} switch(es)")
 
     if args.dry_run:
         print("\nSwitches:")
